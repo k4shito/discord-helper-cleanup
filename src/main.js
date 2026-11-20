@@ -5,16 +5,27 @@ import { ConfigError, loadLocalEnvironment, readConfig } from "./config.js";
 import {
   configuredGuild,
   createDiscordAdapter,
+  createRoleAdapter,
   normalizeMessage,
 } from "./discord.js";
 import { Queue } from "./queue.js";
+import { ReactionRoles } from "./reaction-roles.js";
 
 async function run(config) {
+  const { rolePosts } = config;
+  const reactsToRoles = Boolean(rolePosts.rules || rolePosts.themes);
   const client = new Client({
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
       GatewayIntentBits.MessageContent,
+      ...(reactsToRoles
+        ? [
+            GatewayIntentBits.GuildMembers,
+            GatewayIntentBits.GuildMessageReactions,
+            GatewayIntentBits.GuildModeration,
+          ]
+        : []),
     ],
     rest: { retries: 0, timeout: 10_000 },
   });
@@ -51,6 +62,8 @@ async function run(config) {
     });
     await Promise.all([client.login(config.token), ready]);
     const guild = await configuredGuild(client, config);
+    const roleAdapter = reactsToRoles ? createRoleAdapter(client, guild) : null;
+    await roleAdapter?.checkPosts(rolePosts);
     if (shutdown.signal.aborted) return;
 
     try {
@@ -68,6 +81,32 @@ async function run(config) {
       queue,
       createDiscordAdapter(client, guild),
     );
+    const roles =
+      roleAdapter &&
+      new ReactionRoles(queue.database, config.guildId, rolePosts, roleAdapter);
+    if (roles) {
+      client.on(Events.Raw, (packet) => {
+        if (shutdown.signal.aborted) return;
+        try {
+          roles.onRaw(packet);
+        } catch {
+          console.warn("Не удалось записать событие роли в SQLite.");
+        }
+      });
+      client.on(Events.GuildMemberUpdate, (before, after) => {
+        if (shutdown.signal.aborted || after.guild.id !== config.guildId)
+          return;
+        try {
+          roles.onMemberUpdate(
+            after.id,
+            new Set(before.roles.cache.keys()),
+            new Set(after.roles.cache.keys()),
+          );
+        } catch {
+          console.warn("Не удалось сохранить изменение роли участника.");
+        }
+      });
+    }
     client.on(Events.MessageCreate, (message) => {
       if (shutdown.signal.aborted || message.guildId !== config.guildId) return;
       try {
@@ -77,7 +116,7 @@ async function run(config) {
       }
     });
 
-    if (config.mode === "delete") {
+    if (config.mode === "delete" || roleAdapter) {
       let nextSweep = Date.now() + 60 * 60 * 1000;
       timer = setInterval(() => {
         if (inFlight) return;
@@ -88,6 +127,7 @@ async function run(config) {
               queue.sweep(now);
               nextSweep = now + 60 * 60 * 1000;
             }
+            await roles?.tick(now);
             await cleanup.tick(now);
           })
           .catch(() => {
@@ -135,7 +175,7 @@ try {
     error.code === 4014
   ) {
     console.error(
-      "Включите Message Content Intent в разделе Bot в Discord Developer Portal.",
+      "Включите Message Content Intent в разделе Bot в Discord Developer Portal. Для ролей по реакциям нужен также Server Members Intent.",
     );
     process.exitCode = 78;
   } else {
